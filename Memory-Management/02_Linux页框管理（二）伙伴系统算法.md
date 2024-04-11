@@ -167,3 +167,113 @@ static inline void __list_del(struct list_head * prev, struct list_head * next)
 
 
 ## 释放块
+
+__free_pages_bulk函数按照伙伴系统的策略释放页框。它使用3个基本输入参数。
+page
+	被释放的块中第一个页面描述符的地址
+zone
+	管理区描述符
+order 
+	被释放的块的大小
+
+```c
+static inline void __free_pages_bulk (struct page *page, struct page *base,
+		struct zone *zone, unsigned int order)
+{
+	unsigned long page_idx;
+	struct page *coalesced;
+	int order_size = 1 << order; 
+
+	if (unlikely(order))
+		destroy_compound_page(page, order);
+	page_idx = page - base;
+	
+	BUG_ON(page_idx & (order_size - 1));
+	BUG_ON(bad_range(zone, page));
+
+	zone->free_pages += order_size;
+	while (order < MAX_ORDER-1) {
+		struct free_area *area;
+		struct page *buddy;
+		int buddy_idx;
+
+		buddy_idx = (page_idx ^ (1 << order));
+		buddy = base + buddy_idx;
+		if (bad_range(zone, buddy))
+			break;
+		if (!page_is_buddy(buddy, order))
+			break;
+		/* Move the buddy up one level. */
+		list_del(&buddy->lru);
+		area = zone->free_area + order;
+		area->nr_free--;
+		rmv_page_order(buddy);
+		page_idx &= buddy_idx;
+		order++;
+	}
+	coalesced = base + page_idx;
+	set_page_order(coalesced, order);
+	list_add(&coalesced->lru, &zone->free_area[order].free_list);
+	zone->free_area[order].nr_free++;
+}
+``
+
+```c
+	int order_size = 1 << order; 
+	zone->free_pages += order_size;
+```
+order_size为计算出的当前页块的数目
+然后加入 zone->free_pages 页数目计数
+
+然后是while循环，循环最多进行 MAX_ORDER-1 - order 次
+为什么是 MAX_ORDER-1 呢，因为 order最大下标为 MAX_order - 1
+
+```c
+	struct page *buddy;
+	int buddy_idx;
+	buddy_idx = (page_idx ^ (1 << order));
+	buddy = base + buddy_idx;
+```
+在while循环中寻找当前页框块的伙伴页框块 `buddy_idx` ， 伙伴块的下标可以使用位运算简单运算
+(page_idx ^ (1 << order)) 将页框块的下标的第 order 位取反，相当于page_index + (1 << order) 或者 page_index - (1 << order)
+
+一旦知道了伙伴块的下标，就可以根据基址找到伙伴块的下标
+
+```c
+	if (bad_range(zone, buddy))
+		break;
+	if (!page_is_buddy(buddy, order))
+		break;
+	/* Move the buddy up one level. */
+	list_del(&buddy->lru);
+	area = zone->free_area + order;
+	area->nr_free--;
+	rmv_page_order(buddy);
+	page_idx &= buddy_idx;
+	order++;
+```
+接下来是检查该伙伴块是否合法，如果该伙伴块合法，则将这个伙伴块从当前free_area中删除，相当于将当前块和伙伴块合并
+然后想上一级order + 1 free_area继续寻找
+
+```c
+static inline int page_is_buddy(struct page *page, int order)
+{
+       if (PagePrivate(page)           &&
+           (page_order(page) == order) &&
+           !PageReserved(page)         &&
+            page_count(page) == 0)
+               return 1;
+       return 0;
+}
+```
+检查一个伙伴块是否合法，首先检查page的Private字段是否合法，然后检查Private字段的值是否为oroder再然后检查页框的属性是否为可移动内存，最后他的 page的_count字段必须为-1 page_count在页空闲时返回 0。
+以上条件均满足后，就可以释放伙伴块，继续向上尝试合并更大的块
+
+```c
+	coalesced = base + page_idx;
+	set_page_order(coalesced, order);
+	list_add(&coalesced->lru, &zone->free_area[order].free_list);
+	zone->free_area[order].nr_free++;
+```
+最终跳出while循环就开始将块合并进入对应order的free_area中
+
