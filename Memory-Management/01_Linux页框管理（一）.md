@@ -140,22 +140,25 @@ pkmap_count 为页的引用计数
 >
 > page_count 函数返回_count + 1的值，为使用该页的使用者数量
 
-**linux 源码 highmem.h解释了高端内存的顺序** 
+**linux 源码 highmem.h解释了高端内存映射的顺序** 
+
 ```c
 /*
  * Ordering is:
  *
- * FIXADDR_TOP
+ * FIXADDR_TOP  1024MB
  * 			fixed_addresses
  * FIXADDR_START
  * 			temp fixed addresses
  * FIXADDR_BOOT_START
  * 			Persistent kmap area  // 永久内核映射区域
  * PKMAP_BASE  // 永久内核映射的起始
+ *   8kb
  * VMALLOC_END
  * 			Vmalloc area
  * VMALLOC_START
- * high_memory
+ *	 8mb
+ * high_memory  896MB
  */
 ```
 
