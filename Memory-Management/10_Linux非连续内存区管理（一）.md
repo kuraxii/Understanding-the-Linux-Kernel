@@ -228,5 +228,97 @@ int map_vm_area(struct vm_struct *area, pgprot_t prot, struct page ***pages)
 	return err;
 }
 ```
+除了`vmalloc()`函数外，非来纳许内存区还能由`vmalloc_32()`函数分配，但是它只从`ZONE_NORMAL`和`ZONE_DMA`内存管理区中分配页框
+
+Linux2.6还特别提供了一个vmap函数与vmalloc很相似，**但是他不分配页框**。完成的工作是，在vmalloc虚拟地址空间中找到一个空闲区域，然后将page页面数组对应的物理内存映射到该区域，最终返回映射的虚拟起始地址。
 
 ## 释放非连续内存区
+
+`vfree()`函数释放`vmalloc()`或者`vmalloc_32()`创建的非连续内存区，而`vunmap()`函数释放`vmap()`创建的内存区。两个函数都是用同一个参数————将要释放的内存区的线性地址`address`，他们都依赖于`__vunmap()`函数来做实质上的工作。该函数执行以下操作：
+1. 调用`remove_vm_area()`函数得到`vm_struct`描述符的地址`area`，并清除非连续内存区中的线性地址对应的内核的页表项
+2. 如果`deallocate`被置位，函数扫描指向页描述符的`area->pages`指针数组，对于数组的每一个元素，调用`__free_page()`函数释放页框到分区页框分配器。此外，执行`kfree(area->pages)`来释放数组本身。
+3. 调用`kfree(area)`来释放`vm_struct`描述符。
+
+
+```c
+/*  vfree 和 vunmap 通过置位__vunmap函数的deallocate_pages的值来决定是否释放pages中的页框，
+	当然一般是 vmalloc vfree，vmap vunmap成对使用
+*/
+void vfree(void *addr)
+{
+	BUG_ON(in_interrupt());
+	__vunmap(addr, 1);
+}
+void vunmap(void *addr)
+{
+	BUG_ON(in_interrupt());
+	__vunmap(addr, 0);
+}
+
+
+
+void __vunmap(void *addr, int deallocate_pages)
+{
+	struct vm_struct *area;
+
+	if (!addr)
+		return;
+	
+	// 检查 address是否页对齐
+	if ((PAGE_SIZE-1) & (unsigned long)addr) {
+		printk(KERN_ERR "Trying to vfree() bad address (%p)\n", addr);
+		WARN_ON(1);
+		return;
+	}
+
+	// 从全局内核页表目录开始，逐级取消映射
+	area = remove_vm_area(addr);
+	if (unlikely(!area)) {
+		printk(KERN_ERR "Trying to vfree() nonexistent vm area (%p)\n",
+				addr);
+		WARN_ON(1);
+		return;
+	}
+	// 根据传入的标志决定是否释放页框，vfree释放，vunmap不释放页框
+	if (deallocate_pages) {
+		int i;
+
+		// 释放归还页框
+		for (i = 0; i < area->nr_pages; i++) {
+			if (unlikely(!area->pages[i]))
+				BUG();
+			__free_page(area->pages[i]);
+		}
+
+		// 然后再释放为页框描述符申请的页框描述符数组
+		if (area->nr_pages > PAGE_SIZE/sizeof(struct page *))
+			vfree(area->pages);
+		else
+			kfree(area->pages);
+	}
+
+	kfree(area);
+	return;
+}
+
+```c
+struct vm_struct *remove_vm_area(void *addr)
+{
+	struct vm_struct **p, *tmp;
+
+	write_lock(&vmlist_lock);
+	// 遍历 vmlist链表，找到要移除的非连续内存区
+	for (p = &vmlist ; (tmp = *p) != NULL ;p = &tmp->next) {
+		 if (tmp->addr == addr)
+			 goto found;
+	}
+	write_unlock(&vmlist_lock);
+	return NULL;
+
+found:
+	unmap_vm_area(tmp);
+	*p = tmp->next;
+	write_unlock(&vmlist_lock);
+	return tmp;
+}
+```

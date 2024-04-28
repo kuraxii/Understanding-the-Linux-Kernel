@@ -227,7 +227,7 @@ start:
 		 * Sleep for somebody else to unmap their entries
 		 */
 
-         // 如果没有查询到，等待直到其他进程释放了页框
+         /* 如果没有查询到，等待直到其他进程释放了页框 */
 		{
 			DECLARE_WAITQUEUE(wait, current);
 
