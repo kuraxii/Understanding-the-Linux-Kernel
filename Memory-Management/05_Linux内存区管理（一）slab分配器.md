@@ -39,7 +39,7 @@ struct array_cache {
 	/* 在从缓存中移除一个对象时，touched = 1，else touched = 0 */
 	unsigned int touched;
 	spinlock_t lock;
-	/* 用于内存对齐填充 无实际作用*/
+	/* 对象数组 */
 	void *entry[];	
 };
 ```
@@ -57,6 +57,7 @@ struct kmem_cache {
 	unsigned int shared;
 	/* 指定了缓存中管理的对象的大小 */
 	unsigned int buffer_size;
+	/* 对象大小的倒数，用于计算对象地址 */
 	u32 reciprocal_buffer_size;
 
 /* 3) touched by every alloc & free from the backend */
@@ -283,12 +284,6 @@ kmem_cache_create (const char *name, size_t size, size_t align,
 	cachep->ctor = ctor;
 	cachep->name = name;
 
-	if (setup_cpu_cache(cachep)) {
-		__kmem_cache_destroy(cachep);
-		cachep = NULL;
-		goto oops;
-	}
-
 	//设置per-cpu缓存
 	if (setup_cpu_cache(cachep)) {
 		__kmem_cache_destroy(cachep);
@@ -308,7 +303,463 @@ oops:
 EXPORT_SYMBOL(kmem_cache_create);
 ```
 
-## 分配对象
+## 分配对象与释放对象
+### 1. 分配对象
+```c
+/* 分配对象可用使用kmalloc 和  kmem_cache_alloc 两种函数*/
+/* kmalloc 在后面有提到 */
+
+void *kmem_cache_alloc(struct kmem_cache *cachep, gfp_t flags)
+{
+	return __cache_alloc(cachep, flags, __builtin_return_address(0));
+}
+
+static __always_inline void *
+__cache_alloc(struct kmem_cache *cachep, gfp_t flags, void *caller)
+{
+	unsigned long save_flags;
+	void *objp;
+
+	/* 首先尝试从per-CPU缓存分配对象，对于per-CPU缓存分配只需要防止分配被中断 */
+	local_irq_save(save_flags);
+
+	/* 前端函数 */
+	objp = __do_cache_alloc(cachep, flags);
+	local_irq_restore(save_flags);
+
+
+	// 将对象空间置0
+	if (unlikely((flags & __GFP_ZERO) && objp))
+		memset(objp, 0, obj_size(cachep));
+
+	return objp;
+}
+
+static __always_inline void *
+__do_cache_alloc(struct kmem_cache *cachep, gfp_t flags)
+{
+	return ____cache_alloc(cachep, flags);
+}
+
+static inline void *____cache_alloc(struct kmem_cache *cachep, gfp_t flags)
+{
+	void *objp;
+	struct array_cache *ac;
+
+	check_irq_off();
+
+
+	/* 尝试从per-CPU缓存获取对象 */
+	/*
+		通过当前cpuid 获取per-CPU缓存
+		展开后 
+		cachep->array[smp_processor_id()]
+	*/
+	ac = cpu_cache_get(cachep);
+	if (likely(ac->avail)) { /* 检查是否有可用对象 */
+		ac->touched = 1;
+		objp = ac->entry[--ac->avail];
+	} else {
+		/* 
+			从per-CPU缓存获取失败，从缓存获取对象 
+			在最坏的情况下，可能需要创建新的slab
+		*/ 
+		objp = cache_alloc_refill(cachep, flags);
+	}
+	return objp;
+}
+
+/* 填充per-CPU缓存 */
+static void *cache_alloc_refill(struct kmem_cache *cachep, gfp_t flags)
+{
+	int batchcount;
+	struct kmem_list3 *l3;
+	struct array_cache *ac;
+	int node;
+
+	node = numa_node_id();
+
+	check_irq_off();
+
+	/* 获取当前cpu的高速缓存 */
+	ac = cpu_cache_get(cachep);
+retry:
+	/* 每次需要填充的对象的数量 */
+	batchcount = ac->batchcount;
+	if (!ac->touched && batchcount > BATCHREFILL_LIMIT) {
+		/* 如果不是经常活动的缓存，则不将对象填充满 */
+		batchcount = BATCHREFILL_LIMIT;
+	}
+	l3 = cachep->nodelists[node];  // 获取当前节点的slab缓存
+
+	BUG_ON(ac->avail > 0 || !l3);
+
+	/* 对缓存的操作，需要加锁 */ 
+	spin_lock(&l3->list_lock);
+
+	/* 尝试从共享数组中填充 */
+	if (l3->shared && transfer_objects(ac, l3->shared, batchcount))
+		goto alloc_done;
+
+	/*  
+		老老实实的从高速缓存中分配 
+		这个双城循环会遍历所有的slab，直到per-CPU分配了batchcount个对象
+	*/	
+	while (batchcount > 0) {
+		struct list_head *entry;
+		struct slab *slabp;
+		/* 先从半满的链表填充 */
+		entry = l3->slabs_partial.next;
+		/* 如果半满的都空了，则从全空的分配 */
+		if (entry == &l3->slabs_partial) {
+			l3->free_touched = 1;
+			entry = l3->slabs_free.next;
+			/* 全空的slab也空了，则必须扩充slab了 */
+			if (entry == &l3->slabs_free)
+				goto must_grow;
+		}
+
+		/* 从可分配的slab链表节点，获取slab（可能是全空或者半空） */
+		slabp = list_entry(entry, struct slab, list);
+
+		check_spinlock_acquired(cachep);
+
+		/* 循环从 slab 分配 batchcount个对象*/
+		while (slabp->inuse < cachep->num && batchcount--) {
+			ac->entry[ac->avail++] = slab_get_obj(cachep, slabp,node);
+		}
+
+		/* slab的状态改变，根据对象的情况将slab重新移动到半满或者全满节点中 */
+		list_del(&slabp->list);
+		if (slabp->free == BUFCTL_END)
+			list_add(&slabp->list, &l3->slabs_full);
+		else
+			list_add(&slabp->list, &l3->slabs_partial);
+	}
+
+must_grow:
+	/* 已经分配了avail个对象， kmem_list3也要更新相应的变量*/
+	l3->free_objects -= ac->avail;
+alloc_done:
+	spin_unlock(&l3->list_lock);
+
+	/* 如果cpu缓存为空，给缓存填充 */
+	if (unlikely(!ac->avail)) {
+		int x;
+		/* cache 在下一节讲到 */
+		x = cache_grow(cachep, flags | GFP_THISNODE, node, NULL);
+
+		/* cache_grow can reenable interrupts, then ac could change. */
+		ac = cpu_cache_get(cachep);
+		if (!x && ac->avail == 0)	/* no objects in sight? abort */
+			return NULL;
+
+		if (!ac->avail)		/* objects refilled by interrupt? */
+			goto retry;
+	}
+	ac->touched = 1;
+	return ac->entry[--ac->avail];
+}
+
+static void *slab_get_obj(struct kmem_cache *cachep, struct slab *slabp,
+				int nodeid)
+{
+	/*  static inline void *index_to_obj(struct kmem_cache *cache, struct slab *slab,
+				 unsigned int idx)
+		{
+			return slab->s_mem + cache->buffer_size * idx;
+		}
+ 	*/
+	/* 从slab的 free成员找到对象的指针 */
+	void *objp = index_to_obj(cachep, slabp, slabp->free);
+	
+	kmem_bufctl_t next;
+	slabp->inuse++; 
+
+	/*获得slab_bufctl[slab->free]的值，为下一次锁定的空闲下标 */
+	/*
+	static inline kmem_bufctl_t *slab_bufctl(struct slab *slabp)
+	{
+		return (kmem_bufctl_t *) (slabp + 1);
+	}
+	*/
+	next = slab_bufctl(slabp)[slabp->free];
+	/* 将锁定下标放到free中 */
+	slabp->free = next;
+
+	return objp;
+}
+```
+### 2. 释放对象
+```c
+void kmem_cache_free(struct kmem_cache *cachep, void *objp)
+{
+	local_irq_save(flags);
+	__cache_free(cachep, objp);
+	local_irq_restore(flags);
+}
+
+static inline void __cache_free(struct kmem_cache *cachep, void *objp)
+{
+	struct array_cache *ac = cpu_cache_get(cachep);
+
+
+	/* 检查per-CPU是否有可用空间，如果有就加入到per-CPU缓存 */
+	if (likely(ac->avail < ac->limit)) {
+		ac->entry[ac->avail++] = objp;
+		return;
+	} else {
+		/* 否则就 将部分per-CPU 对象加入到slab */
+		cache_flusharray(cachep, ac);
+		ac->entry[ac->avail++] = objp;
+	}
+}
+
+/* 将部分cpu高速缓存flush到slub中 */
+static void cache_flusharray(struct kmem_cache *cachep, struct array_cache *ac)
+{
+	int batchcount;
+	struct kmem_list3 *l3;
+	int node = numa_node_id();
+
+	/* 指定flush的数量 */
+	batchcount = ac->batchcount;
+
+	check_irq_off();
+	l3 = cachep->nodelists[node];
+	spin_lock(&l3->list_lock);
+	/* 如果cpu共享缓存存在，则将共享缓存填满，然后返回 */
+	if (l3->shared) {
+		struct array_cache *shared_array = l3->shared;
+		int max = shared_array->limit - shared_array->avail;
+		if (max) {
+			if (batchcount > max)
+				batchcount = max;
+			memcpy(&(shared_array->entry[shared_array->avail]),
+			       ac->entry, sizeof(void *) * batchcount);
+			shared_array->avail += batchcount;
+			goto free_done;
+		}
+	}
+	free_block(cachep, ac->entry, batchcount, node);
+
+free_done:
+	spin_unlock(&l3->list_lock);
+	ac->avail -= batchcount;
+	memmove(ac->entry, &(ac->entry[batchcount]), sizeof(void *)*ac->avail);
+}
+
+static void free_block(struct kmem_cache *cachep, void **objpp, int nr_objects,
+		       int node)
+{
+	int i;
+	struct kmem_list3 *l3;
+
+	for (i = 0; i < nr_objects; i++) {
+		void *objp = objpp[i];
+		struct slab *slabp;
+
+		slabp = virt_to_slab(objp);
+		l3 = cachep->nodelists[node];
+		list_del(&slabp->list);
+		check_spinlock_acquired_node(cachep, node);
+		slab_put_obj(cachep, slabp, objp, node);
+		l3->free_objects++;
+	
+		/* 如果slab内都是未分配的对象，则将slab置于 slabs_free */
+		if (slabp->inuse == 0) {
+			/* 如果slab中的对象数超过了缓存对象限制，则释放这个slab */
+			if (l3->free_objects > l3->free_limit) {
+				l3->free_objects -= cachep->num;
+
+				slab_destroy(cachep, slabp);
+			} else {
+				list_add(&slabp->list, &l3->slabs_free);
+			}
+		} else {
+			/* 同时包含使用和未使用的对象，将slab添加到 slabs_partial */
+			list_add_tail(&slabp->list, &l3->slabs_partial);
+		}
+	}
+}
+
+static void slab_destroy(struct kmem_cache *cachep, struct slab *slabp)
+{
+	/* 减去着色偏移 */
+	void *addr = slabp->s_mem - slabp->colouroff;
+
+	/* 对每个对象调用析构函数 */
+	slab_destroy_objs(cachep, slabp);
+	if (unlikely(cachep->flags & SLAB_DESTROY_BY_RCU)) {
+		struct slab_rcu *slab_rcu;
+
+		slab_rcu = (struct slab_rcu *)slabp;
+		slab_rcu->cachep = cachep;
+		slab_rcu->addr = addr;
+		call_rcu(&slab_rcu->head, kmem_rcu_free);
+	} else {
+		/* 这里只关注普通的cache。调用 kmem_freepages释放对象页框 */
+		kmem_freepages(cachep, addr);
+		if (OFF_SLAB(cachep))
+			kmem_cache_free(cachep->slabp_cache, slabp);
+	}
+}
+static void kmem_freepages(struct kmem_cache *cachep, void *addr)
+{
+	unsigned long i = (1 << cachep->gfporder);
+	struct page *page = virt_to_page(addr);
+	const unsigned long nr_freed = i;
+
+	if (cachep->flags & SLAB_RECLAIM_ACCOUNT)
+		sub_zone_page_state(page_zone(page),
+				NR_SLAB_RECLAIMABLE, nr_freed);
+	else
+		sub_zone_page_state(page_zone(page),
+				NR_SLAB_UNRECLAIMABLE, nr_freed);
+	
+	/* 依次清除页框中的slab标志 */
+	while (i--) {
+		__ClearPageSlab(page);
+		page++;
+	}
+	/* 将页框归还到伙伴系统 */
+	free_pages((unsigned long)addr, cachep->gfporder);
+}
+```
+
+
+## 为slab分配对象
+
+```c
+static int cache_grow(struct kmem_cache *cachep,
+		gfp_t flags, int nodeid, void *objp)
+{
+	struct slab *slabp;
+	size_t offset;
+	gfp_t local_flags;
+	struct kmem_list3 *l3;
+
+	local_flags = flags & (GFP_CONSTRAINT_MASK | GFP_RECLAIM_MASK);
+
+	check_irq_off();
+	l3 = cachep->nodelists[nodeid];
+	spin_lock(&l3->list_lock);
+
+	/* 计算偏移量和下一个颜色 */
+	offset = l3->colour_next;
+	l3->colour_next++;
+	/* 如果到了最大值就归0 */ 
+	if (l3->colour_next >= cachep->colour)
+		l3->colour_next = 0;
+
+	spin_unlock(&l3->list_lock);
+
+	/* 根据着色计算出偏移 */
+	offset *= cachep->colour_off;
+
+	if (local_flags & __GFP_WAIT)
+		local_irq_enable();
+
+
+	kmem_flagcheck(cachep, flags);
+
+	/* 从伙伴系统获得物理页 */
+	if (!objp)
+		objp = kmem_getpages(cachep, local_flags, nodeid);
+	if (!objp)
+		goto failed;
+
+	/* 则调用此函数 申请 slab 头*/
+	slabp = alloc_slabmgmt(cachep, objp, offset,
+			local_flags & ~GFP_CONSTRAINT_MASK, nodeid);
+	/* 申请失败，释放之前申请的对象 */
+	if (!slabp)
+		goto opps1;
+
+	// 在kmem_cache中数组的下标
+	slabp->nodeid = nodeid;
+
+	/* 依次对每个物理页的lru.next=cache，lru.prev=slab */
+	slab_map_pages(cachep, slabp, objp);
+	/* 
+	static void slab_map_pages(struct kmem_cache *cache, struct slab *slab,
+			   void *addr)
+	{
+		int nr_pages;
+		struct page *page;
+
+		page = virt_to_page(addr);
+
+		nr_pages = 1;
+		if (likely(!PageCompound(page)))
+			nr_pages <<= cache->gfporder;
+
+		do {
+			page_set_cache(page, cache);
+			page_set_slab(page, slab);
+			page++;
+		} while (--nr_pages);
+	}
+	*/
+	
+
+	/* 调用各个对象的构造器函数，初始化新SLAB中的对象 */
+	cache_init_objs(cachep, slabp);
+
+	if (local_flags & __GFP_WAIT)
+		local_irq_disable();
+	check_irq_off();
+	spin_lock(&l3->list_lock);
+
+	/* 将新的SLAB加入到全空链表中*/
+	list_add_tail(&slabp->list, &(l3->slabs_free));
+	/* 新产生的对象的数目也加到缓存中空闲对象的数目上（cachep->free_objects） */
+	l3->free_objects += cachep->num;
+
+	spin_unlock(&l3->list_lock);
+	return 1;
+opps1:
+	kmem_freepages(cachep, objp);
+failed:
+	if (local_flags & __GFP_WAIT)
+		local_irq_disable();
+	return 0;
+}
+
+
+/* slab与伙伴系统的接口 */
+static void *kmem_getpages(struct kmem_cache *cachep, gfp_t flags, int nodeid)
+{
+	struct page *page;
+	int nr_pages;
+	int i;
+
+#ifndef CONFIG_MMU
+	flags |= __GFP_COMP;
+#endif
+
+	flags |= cachep->gfpflags;
+	if (cachep->flags & SLAB_RECLAIM_ACCOUNT)
+		flags |= __GFP_RECLAIMABLE;
+	/* 在伙伴系统分配页框 */
+	page = alloc_pages_node(nodeid, flags, cachep->gfporder);
+	if (!page)
+		return NULL;
+
+	nr_pages = (1 << cachep->gfporder);
+	if (cachep->flags & SLAB_RECLAIM_ACCOUNT)
+		add_zone_page_state(page_zone(page),
+			NR_SLAB_RECLAIMABLE, nr_pages);
+	else
+		add_zone_page_state(page_zone(page),
+			NR_SLAB_UNRECLAIMABLE, nr_pages);
+
+	/* 为每个页框设置slab标志 */
+	for (i = 0; i < nr_pages; i++)
+		__SetPageSlab(page + i);
+	return page_address(page);
+}
+```
 
 
 
@@ -399,7 +850,7 @@ found:
 			return kmem_cache_alloc(malloc_sizes[i].cs_dmacachep,
 						flags);
 #endif
-		/* 使用预定义的缓存，没有cache_grow等检查操作 */
+		/* 使用预定义的缓存，没有多余检查操作 */
 		return kmem_cache_alloc(malloc_sizes[i].cs_cachep, flags);
 	}
 	/* size 不是常数则调用kamlloc */
@@ -445,6 +896,38 @@ static inline struct kmem_cache *__find_general_cachep(size_t size,
 		return csizep->cs_dmacachep;
 #endif
 	return csizep->cs_cachep;
+}
+
+void kfree(const void *objp)
+{
+	struct kmem_cache *c;
+	unsigned long flags;
+
+	if (unlikely(ZERO_OR_NULL_PTR(objp)))
+		return;
+	local_irq_save(flags);
+	kfree_debugcheck(objp);
+	c = virt_to_cache(objp);
+	debug_check_no_locks_freed(objp, obj_size(c));
+	/* 在找到与内存指针关联的缓存之后，kfree将实际工作移交上文讨论过的__cache_free函数完成。 */
+	__cache_free(c, (void *)objp);
+	local_irq_restore(flags);
+}
+
+void kfree(const void *objp)
+{
+	struct kmem_cache *c;
+	unsigned long flags;
+
+	if (unlikely(ZERO_OR_NULL_PTR(objp)))
+		return;
+	local_irq_save(flags);
+	kfree_debugcheck(objp);
+	c = virt_to_cache(objp);
+	debug_check_no_locks_freed(objp, obj_size(c));
+	/* 在找到与内存指针关联的缓存之后，kfree将实际工作移交上文讨论过的__cache_free函数完成。 */
+	__cache_free(c, (void *)objp);
+	local_irq_restore(flags);
 }
 
 ```
