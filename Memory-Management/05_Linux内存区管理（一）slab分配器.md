@@ -234,7 +234,7 @@ kmem_cache_create (const char *name, size_t size, size_t align,
 	*/
 	left_over = calculate_slab_order(cachep, size, align, flags);
 
-	/* num 计算出的slab的大小 */
+	/* num 计算出的slab中对象的数量的大小 */
 	if (!cachep->num) {
 		printk(KERN_ERR
 		       "kmem_cache_create: couldn't create cache %s.\n", name);
@@ -361,7 +361,7 @@ static inline void *____cache_alloc(struct kmem_cache *cachep, gfp_t flags)
 		objp = ac->entry[--ac->avail];
 	} else {
 		/* 
-			从per-CPU缓存获取失败，从缓存获取对象 
+			从per-CPU缓存获取失败，从缓存获取对象填充 per-CPU缓存
 			在最坏的情况下，可能需要创建新的slab
 		*/ 
 		objp = cache_alloc_refill(cachep, flags);
@@ -391,8 +391,6 @@ retry:
 		batchcount = BATCHREFILL_LIMIT;
 	}
 	l3 = cachep->nodelists[node];  // 获取当前节点的slab缓存
-
-	BUG_ON(ac->avail > 0 || !l3);
 
 	/* 对缓存的操作，需要加锁 */ 
 	spin_lock(&l3->list_lock);
@@ -424,7 +422,7 @@ retry:
 
 		check_spinlock_acquired(cachep);
 
-		/* 循环从 slab 分配 batchcount个对象*/
+		/* 循环从 slab 分配 batchcount个对象给per-CPU缓存*/
 		while (slabp->inuse < cachep->num && batchcount--) {
 			ac->entry[ac->avail++] = slab_get_obj(cachep, slabp,node);
 		}
@@ -446,7 +444,7 @@ alloc_done:
 	/* 如果cpu缓存为空，给缓存填充 */
 	if (unlikely(!ac->avail)) {
 		int x;
-		/* cache 在下一节讲到 */
+		/* cache_grow 在下一节讲到 功能时增加缓存中的cache*/
 		x = cache_grow(cachep, flags | GFP_THISNODE, node, NULL);
 
 		/* cache_grow can reenable interrupts, then ac could change. */
@@ -541,6 +539,7 @@ static void cache_flusharray(struct kmem_cache *cachep, struct array_cache *ac)
 			goto free_done;
 		}
 	}
+	/* 再释放到slab内 */
 	free_block(cachep, ac->entry, batchcount, node);
 
 free_done:
@@ -559,6 +558,7 @@ static void free_block(struct kmem_cache *cachep, void **objpp, int nr_objects,
 		void *objp = objpp[i];
 		struct slab *slabp;
 
+		/* 通过地址找到slab描述符 */
 		slabp = virt_to_slab(objp);
 		l3 = cachep->nodelists[node];
 		list_del(&slabp->list);
@@ -566,8 +566,9 @@ static void free_block(struct kmem_cache *cachep, void **objpp, int nr_objects,
 		slab_put_obj(cachep, slabp, objp, node);
 		l3->free_objects++;
 	
-		/* 如果slab内都是未分配的对象，则将slab置于 slabs_free */
+		
 		if (slabp->inuse == 0) {
+			/* 如果slab内都是未分配的对象，则将slab置于 slabs_free */
 			/* 如果slab中的对象数超过了缓存对象限制，则释放这个slab */
 			if (l3->free_objects > l3->free_limit) {
 				l3->free_objects -= cachep->num;
@@ -598,12 +599,13 @@ static void slab_destroy(struct kmem_cache *cachep, struct slab *slabp)
 		slab_rcu->addr = addr;
 		call_rcu(&slab_rcu->head, kmem_rcu_free);
 	} else {
-		/* 这里只关注普通的cache。调用 kmem_freepages释放对象页框 */
+		/* 这里只关注普通的cache。调用 kmem_freepages释放 为slab分配的页框 */
 		kmem_freepages(cachep, addr);
 		if (OFF_SLAB(cachep))
 			kmem_cache_free(cachep->slabp_cache, slabp);
 	}
 }
+
 static void kmem_freepages(struct kmem_cache *cachep, void *addr)
 {
 	unsigned long i = (1 << cachep->gfporder);
@@ -661,8 +663,6 @@ static int cache_grow(struct kmem_cache *cachep,
 		local_irq_enable();
 
 
-	kmem_flagcheck(cachep, flags);
-
 	/* 从伙伴系统获得物理页 */
 	if (!objp)
 		objp = kmem_getpages(cachep, local_flags, nodeid);
@@ -693,13 +693,13 @@ static int cache_grow(struct kmem_cache *cachep,
 		nr_pages = 1;
 		if (likely(!PageCompound(page)))
 			nr_pages <<= cache->gfporder;
-
 		do {
-			page_set_cache(page, cache);
-			page_set_slab(page, slab);
+			page->lru.prev = (struct list_head *)slab;
+			page->lru.next = (struct list_head *)cache;
 			page++;
 		} while (--nr_pages);
 	}
+
 	*/
 	
 
