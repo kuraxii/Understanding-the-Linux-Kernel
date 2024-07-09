@@ -3,6 +3,10 @@
 物理页(PP, Physical Page),物理内存中的页；
 磁盘页(DP, Disk Page),磁盘中的页。
 
+# linux中的分段
+
+
+
 # linux中的分页 (linux 2.6.11)
 
 页全局目录(PGD, Page Global Directory )
@@ -23,7 +27,7 @@
 
 为什么需要两级呢？
 
-目的在于减少每个进程页表所需的 RAM 的数量。如果使用简单的一级页表，将需要高达2^20 个表项来表示每个进程的页表，即时一个进程并不使用所有的地址，二级模式通过职位进程实际使用的那些虚拟内存区请求页表来减少内存容量。
+目的在于减少每个进程页表所需的 RAM 的数量。如果使用简单的一级页表，将需要高达2^20 个表项来表示每个进程的页表，即时一个进程并不使用所有的地址，二级模式通过置位进程实际使用的那些虚拟内存区请求页表来减少内存容量。
 
 **每个活动的进程必须有一个页目录，但是却没有必要马上为所有进程的所有页表都分配 RAM，只有在实际需要一个页表时候才给该页表分配 RAM。**
 
@@ -35,7 +39,7 @@ linux页框采用4kb大小
 
 ## 页描述符
 
-内核必须记录每个页框当前的状态，如内核必须能区分哪些页框包含的时属于进程的页，而哪些页框包含的时内核代码或内核数据
+内核必须记录每个页框当前的状态，如内核必须能区分哪些页框包含的时属于进程的页，而哪些页框包含的是内核代码或内核数据
 
 ```c
 struct page {
@@ -114,6 +118,9 @@ ZOONE_HIGHMEM
 ​	包含从896MB开始高于896MB的内存页框
 
 
+## neicun
+
+
 ## 高端内存页框的映射
 
 内核线性地址空间的最后128mb专门用来映射高端内存页框
@@ -138,7 +145,7 @@ pkmap_count 为页的引用计数
 >
 > 大于-1则说明页框被分配给了一个或多个进程，或用于存放内核数据结构
 >
-> page_count 函数返回_count + 1的值，为使用该页的使用者数量
+> page_count 函数返回pkmap_count + 1的值，为使用该页的使用者数量
 
 **linux 源码 highmem.h解释了高端内存映射的顺序** 
 
@@ -209,7 +216,7 @@ static inline unsigned long map_new_virtual(struct page *page)
 	int count;
 
 start:
-	count = LAST_PKMAP;  // 至少一轮至少循环 LAST_PKMAP 次
+	count = LAST_PKMAP;  // 一轮至少循环 LAST_PKMAP 次
 	/* Find an empty entry */
 	for (;;) {
         // 从上次查询的地方开始查询  last_pkmap_nr = (last_pkmap_nr + 1) & LAST_PKMAP_MASK;
@@ -384,16 +391,17 @@ void *kmap_atomic(struct page *page, enum km_type type)
 
 下面这组宏用来地址映射（地址及page到PTE）以及单个的页表条目的设置,ptep_get_and_clear用来保护和修改页表条目或物理页
 
-|--------名称-------|--------------------功能------------------------------|
-|-------------------|-----------------------------------------------------|
-|mk_pte()	        |  通过 struct page 和 保护位，联合生成一个pte_t 的页表项|
-|mk_pte_phys()      |  类似mk_pte，不同的是使用的页面物理地址作为输入参数     |
-|pte_page	        |  通过pte_t页表项获得memmap中对应的struct page 地址     |
-|pmd_page	        |  通过pmd_t页表项获得memmap中pte所在的struct page 地址  |
-|set_pte	        |  将 mk_pte返回的pte_t 表项内容设置到进程的pte页表项中   |
-|pte_clear	        |  清除pte页表中一个页表项；set_pte的逆操作              |
-|ptep_get_and_clear	|  返回并清除页表中的一个条目pte_t                       |
+| --------名称------- | --------------------功能------------------------------ |
+| ------------------- | ------------------------------------------------------ |
+| mk_pte()            | 通过 struct page 和 保护位，联合生成一个pte_t 的页表项 |
+| mk_pte_phys()       | 类似mk_pte，不同的是使用的页面物理地址作为输入参数     |
+| pte_page            | 通过pte_t页表项获得memmap中对应的struct page 地址      |
+| pmd_page            | 通过pmd_t页表项获得memmap中pte所在的struct page 地址   |
+| set_pte             | 将 mk_pte返回的pte_t 表项内容设置到进程的pte页表项中   |
+| pte_clear           | 清除pte页表中一个页表项；set_pte的逆操作               |
+| ptep_get_and_clear  | 返回并清除页表中的一个条目pte_t                        |
 
 
-## 伙伴系统算法
+
+
 
